@@ -1,13 +1,18 @@
 # kuma_player
 
-A new flutter plugin project.
+A video player for flutter support video cache, and drawing on other app on android.
 
 ## Futures
 
 - Cache video when playing, and play cached video offline.
 - Support draw video on other app on Android.
-    - play and pause button.
-    - pan to move overlay video layer.
-    - pinch to zoom overlay video layer.
+    - Play and pause button.
+    - Pan to move overlay video layer.
+    - Pinch to zoom overlay video layer.
 
 ![Screenshot](pics/Screenshot.jpg)
+
+## Android configuration
+
+The Video Proxy require the [network security configuration](https://developer.android.com/training/articles/security-config).
+
