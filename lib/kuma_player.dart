@@ -14,12 +14,18 @@ import 'package:video_player/video_player.dart';
 
 import 'proxy_server.dart';
 
-class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
+const platform = const MethodChannel('kuma_player');
 
+class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsBindingObserver {
+  bool _overlay = false;
   VideoPlayerController _playerController;
-  ProxyItem proxyItem;
+  ProxyItem _proxyItem;
   Completer<void> _readyCompleter = Completer();
   bool _disposed = false;
+
+  ProxyItem get proxyItem => _proxyItem;
+
+  bool get ready => _readyCompleter.isCompleted;
 
   KumaPlayerController.asset(String dataSource,
       {String package, Future<ClosedCaptionFile>
@@ -33,6 +39,7 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
     );
     _playerController.addListener(_updateValue);
     _playerController.initialize().then((value) => _ready());
+    WidgetsBinding.instance.addObserver(this);
   }
 
 
@@ -46,6 +53,7 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
     );
     _playerController.addListener(_updateValue);
     _playerController.initialize().then((value) => _ready());
+    WidgetsBinding.instance.addObserver(this);
   }
 
   KumaPlayerController.network(String dataSource,
@@ -62,11 +70,15 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
       _playerController.addListener(_updateValue);
       _playerController.initialize().then((value) => _ready());
     });
+    WidgetsBinding.instance.addObserver(this);
   }
 
   void _startUrl(String url, void Function(String) cb) async {
     ProxyServer server = await ProxyServer.instance;
-    proxyItem = server.get(url);
+    _proxyItem = server.get(url);
+    proxyItem.retain();
+    for (var cb in _onSpeeds) proxyItem.addOnSpeed(cb);
+    for (var cb in _onBuffered) proxyItem.addOnBuffered(cb);
     if (!_disposed)
       cb("http://localhost:${server.server.port}/${proxyItem.key}/${proxyItem.entry}");
   }
@@ -77,19 +89,23 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   void _ready() {
     _readyCompleter?.complete();
-    _readyCompleter = null;
   }
+
+  List<BufferedRange> get buffered => proxyItem?.buffered ?? [];
 
   @override
   void dispose() {
     super.dispose();
-    proxyItem?.dispose();
+    for (var cb in _onSpeeds) proxyItem.removeOnSpeed(cb);
+    for (var cb in _onBuffered) proxyItem.removeOnBuffered(cb);
+    proxyItem?.release();
     _playerController?.dispose();
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
   }
 
   Future<void> prepared() {
-    if (_readyCompleter != null) return _readyCompleter.future;
+    if (!_readyCompleter.isCompleted) return _readyCompleter.future;
     return SynchronousFuture(null);
   }
 
@@ -120,6 +136,92 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> {
   Future<void> setPlaybackSpeed(double speed) {
     return _playerController?.setPlaybackSpeed(speed);
   }
+
+  List<void Function(int)> _onSpeeds = [];
+  List<void Function()> _onBuffered = [];
+
+  void addOnSpeed(void Function(int) cb) {
+    _onSpeeds.add(cb);
+    proxyItem?.addOnSpeed(cb);
+  }
+  void removeOnSpeed(void Function(int) cb) {
+    _onSpeeds.remove(cb);
+    proxyItem?.removeOnSpeed(cb);
+  }
+
+  void addOnBuffered(VoidCallback cb) {
+    _onBuffered.add(cb);
+    proxyItem?.addOnBuffered(cb);
+  }
+  void removeOnBuffered(VoidCallback cb) {
+    _onBuffered.remove(cb);
+    proxyItem?.removeOnBuffered(cb);
+  }
+
+  Future<void> _setOverlay(bool overlay, {
+    BuildContext context,
+    String overlayAlert,
+    String overlayButton
+  }) async {
+    if (Platform.isAndroid) {
+      _overlay = overlay;
+      if (_overlay) {
+        if (!await canOverlay()) {
+          await showDialog(
+              context: context,
+              builder: (context) {
+                return AlertDialog(
+                  title: Text(overlayAlert),
+                  actions: [
+                    FlatButton(
+                        child: Text(overlayButton),
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                        }
+                    )
+                  ],
+                );
+              }
+          );
+          await platform.invokeMethod("requestOverlayPermission");
+        }
+      }
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
+    if (_playerController == null) return;
+    switch (state) {
+      case AppLifecycleState.paused: {
+        bool isPlaying = _playerController.value.isPlaying;
+        if (_playerController.value?.size != null && _overlay && await canOverlay()) {
+          // ignore: invalid_use_of_visible_for_testing_member
+          await platform.invokeMethod("requestOverlay", {"textureId": _playerController.textureId});
+          if (isPlaying) _playerController.play();
+        }
+      }
+      break;
+      case AppLifecycleState.resumed:
+        if (_overlay) {
+          // ignore: invalid_use_of_visible_for_testing_member
+          bool isPlaying = await platform.invokeMethod<bool>("removeOverlay", {"textureId": _playerController.textureId});
+          if (_playerController.value.isPlaying != isPlaying) {
+            _playerController.value = _playerController.value.copyWith(isPlaying: isPlaying);
+          }
+        }
+        break;
+      case AppLifecycleState.detached: {
+        break;
+      }
+      default:
+    }
+  }
+
+  Future<bool> canOverlay() {
+    return platform.invokeMethod<bool>("canOverlay");
+  }
+
 }
 
 class KumaPlayer extends StatefulWidget {
@@ -140,10 +242,7 @@ class KumaPlayer extends StatefulWidget {
 
 }
 
-class _KumaPlayerState extends State<KumaPlayer> with WidgetsBindingObserver {
-  bool _overlay = false;
-
-  static const platform = const MethodChannel('kuma_player');
+class _KumaPlayerState extends State<KumaPlayer> {
 
   @override
   Widget build(BuildContext context) {
@@ -153,11 +252,18 @@ class _KumaPlayerState extends State<KumaPlayer> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _setOverlay(widget.overlay);
 
+    widget.controller._setOverlay(
+      widget.overlay,
+      context: context,
+      overlayAlert: widget.overlayAlert,
+      overlayButton: widget.overlayButton
+    );
     widget.controller.prepared().then((value) {
-      setState(() { });
+      try {
+        setState(() { });
+      } catch (e) {
+      }
     });
   }
 
@@ -165,7 +271,12 @@ class _KumaPlayerState extends State<KumaPlayer> with WidgetsBindingObserver {
   void didUpdateWidget(KumaPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.overlay != widget.overlay) {
-      _setOverlay(widget.overlay);
+      widget.controller._setOverlay(
+          widget.overlay,
+          context: context,
+          overlayAlert: widget.overlayAlert,
+          overlayButton: widget.overlayButton
+      );
     }
     if (oldWidget.controller != widget.controller) {
       widget.controller.prepared().then((value) {
@@ -177,65 +288,5 @@ class _KumaPlayerState extends State<KumaPlayer> with WidgetsBindingObserver {
   @override
   void dispose() {
     super.dispose();
-    WidgetsBinding.instance.removeObserver(this);
   }
-
-  Future<bool> canOverlay() {
-    return platform.invokeMethod<bool>("canOverlay");
-  }
-
-  Future<void> _setOverlay(bool overlay) async {
-    if (Platform.isAndroid) {
-      _overlay = overlay;
-      if (_overlay) {
-        if (!await canOverlay()) {
-          await showDialog(
-              context: context,
-              builder: (context) {
-                return AlertDialog(
-                  title: Text(widget.overlayAlert),
-                  actions: [
-                    FlatButton(
-                        child: Text(widget.overlayButton),
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                        }
-                    )
-                  ],
-                );
-              }
-          );
-          await platform.invokeMethod("requestOverlayPermission");
-        }
-      }
-    }
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) async {
-    VideoPlayerController playerController = widget.controller?._playerController;
-    if (playerController == null) return;
-    switch (state) {
-      case AppLifecycleState.paused: {
-        if (_overlay && await canOverlay()) {
-          // ignore: invalid_use_of_visible_for_testing_member
-          await platform.invokeMethod("requestOverlay", {"textureId": playerController.textureId});
-          playerController.play();
-        }
-      }
-        break;
-      case AppLifecycleState.resumed:
-        if (_overlay) {
-          // ignore: invalid_use_of_visible_for_testing_member
-          platform.invokeMethod("removeOverlay", {"textureId": playerController.textureId});
-        }
-        break;
-      case AppLifecycleState.detached: {
-        break;
-      }
-      default:
-    }
-  }
-
-
 }

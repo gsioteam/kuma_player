@@ -1,11 +1,14 @@
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter/cupertino.dart';
 import 'package:http_multi_server/http_multi_server.dart';
 import 'package:shelf/shelf.dart';
 import 'cache_manager.dart';
+import 'load_item.dart';
 import 'request_queue.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:path/path.dart' as p;
@@ -19,35 +22,17 @@ String _calculateKey(String url) {
   return hash.toString();
 }
 
-class ProxyData {
+class _ProxyData {
   String url;
+  dynamic customerData;
 
-  ProxyData(this.url);
-}
-
-class ResponseRange {
-  int total;
-  int start;
-  int end;
-
-  ResponseRange({this.total, this.start, this.end});
+  _ProxyData(this.url, [this.customerData]);
 }
 
 class _RangeData {
   int start, end;
 
   _RangeData(this.start, this.end);
-}
-class ResponseData {
-  dynamic body;
-  Map<String, Object> headers;
-  ResponseRange range;
-
-  ResponseData({
-    this.body,
-    this.headers,
-    this.range
-  });
 }
 
 _RangeData _getRange(Map<String, String> headers) {
@@ -69,12 +54,19 @@ _RangeData _getRange(Map<String, String> headers) {
   }
 }
 
+class BufferedRange {
+  double start = 0;
+  double end = 0;
+
+  BufferedRange();
+}
+
 abstract class ProxyItem {
   Uri _url;
   String _base;
   String _key;
   String _entry;
-  Map<String, ProxyData> _files = Map();
+  Map<String, _ProxyData> _files = Map();
   ProxyServer _server;
   RequestQueue _queue = RequestQueue();
   Uri get url => _url;
@@ -82,8 +74,18 @@ abstract class ProxyItem {
   String get key => _key;
   String get entry => _entry;
   ProxyServer get server => _server;
+  Timer _timer;
+  int _oldSpeed = 0;
+  int _speed = 0;
+  List<void Function(int)> _onSpeeds = [];
+  List<void Function()> _onBuffered = [];
 
-  ProxyItem._(String url) {
+  List<LoadItem> _loadItems = List();
+  Map<String, LoadItem> _loadItemIndex = Map();
+
+  List<LoadItem> get loadItems => _loadItems;
+
+  ProxyItem._(this._server, String url) {
     int index = url.lastIndexOf("/");
     if (index < 0) {
       throw "Wrong url $_url";
@@ -92,10 +94,24 @@ abstract class ProxyItem {
     _base = url.substring(0, index + 1);
     _url = Uri.parse(url);
     _key = _calculateKey(url);
-    _files[entry] = ProxyData(url);
+    _files[entry] = _ProxyData(url);
+
+    _timer = Timer(Duration(seconds: 1), _speedTimer);
   }
 
-  factory ProxyItem(String url) {
+  void _speedTimer() {
+    _oldSpeed = _speed;
+    for (var onSpeed in _onSpeeds)
+      onSpeed(_oldSpeed);
+    _speed = 0;
+    _timer = Timer(Duration(seconds: 1), _speedTimer);
+  }
+
+  void _receiveData(int length) {
+    _speed += length;
+  }
+
+  factory ProxyItem(ProxyServer server, String url) {
     int idx = url.indexOf('?');
     String raw;
     if (idx >= 0) {
@@ -112,17 +128,90 @@ abstract class ProxyItem {
       ext = filename.substring(idx + 1).toLowerCase();
     }
     if (ext == "m3u8") {
-      return HlsProxyItem._(url);
+      return HlsProxyItem._(server, url);
     } else {
-      return SingleProxyItem._(url);
+      return SingleProxyItem._(server, url);
     }
   }
 
   Future<Response> handle(Request request, String key);
 
+  int _retainCount = 0;
+  void retain() {
+    _retainCount ++;
+  }
+
+  void release() {
+    _retainCount --;
+    if (_retainCount <= 0) dispose();
+  }
+
   void dispose() {
     server._removeItem(this);
+    _timer.cancel();
   }
+
+  void itemLoaded(LoadItem item, List<List<int>> chunks) {
+    _buffered = null;
+    for (var onBuffered in _onBuffered)
+      onBuffered();
+  }
+
+  void addLoadItem(LoadItem item) {
+    _loadItems.add(item);
+    _loadItemIndex[item.cacheKey] = item;
+    _buffered = null;
+  }
+
+  LoadItem getLoadItem(String cacheKey) => _loadItemIndex[cacheKey];
+
+  List<BufferedRange> _buffered;
+  List<BufferedRange> get buffered {
+    if (_buffered == null) {
+      _buffered = [];
+      List<_RangeData> ranges = [];
+      bool outRange = true;
+      int offset = 0;
+      _RangeData range;
+      for (LoadItem item in _loadItems) {
+        if (outRange) {
+          if (item.loaded) {
+            range = _RangeData(offset, offset + item.weight);
+            outRange = false;
+          } else {
+          }
+        } else {
+          if (item.loaded) {
+            range.end += item.weight;
+          } else {
+            ranges.add(range);
+            range = null;
+            outRange = true;
+          }
+        }
+        offset += item.weight;
+      }
+      if (range != null) ranges.add(range);
+
+      for (_RangeData range in ranges) {
+        _buffered.add(BufferedRange()
+          ..start = (offset == 0 ? 0 : range.start / offset)
+          ..end = (offset == 0 ? 0 : range.end / offset)
+        );
+      }
+    }
+    return _buffered;
+  }
+
+  void addOnSpeed(void Function(int) cb) => _onSpeeds.add(cb);
+  void removeOnSpeed(void Function(int) cb) => _onSpeeds.remove(cb);
+
+  void addOnBuffered(VoidCallback cb) => _onBuffered.add(cb);
+  void removeOnBuffered(VoidCallback cb) => _onBuffered.remove(cb);
+
+  Future<void> checkBuffered();
+
+  void processBuffer(LoadItem item, List<int> buffer);
 }
 
 enum ParseState {
@@ -134,7 +223,18 @@ class HlsProxyItem extends ProxyItem {
 
   Map<Uri, String> cached = Map();
 
-  HlsProxyItem._(String url) : super._(url);
+  HlsProxyItem._(ProxyServer server, String url) : super._(server, url) {
+    String cacheKey = "$key/$entry";
+    addLoadItem(LoadItem(
+      proxyItem: this,
+      weight: 1,
+      cacheKey: cacheKey,
+      builder: () => _queue.start(url),
+      data: url
+    ));
+    _ProxyData proxyData = _files[entry];
+    proxyData.customerData = getLoadItem(cacheKey);
+  }
 
   String getFileEntry(String url) {
     int index;
@@ -163,12 +263,24 @@ class HlsProxyItem extends ProxyItem {
 
   String _insertFile(String url) {
     String entry = getFileEntry(url);
-    _files[entry] = ProxyData(url);
+    if (!_files.containsKey(entry)) {
+      String cacheKey = "$key/$entry";
+      var item = LoadItem(
+        proxyItem: this,
+        cacheKey: cacheKey,
+        weight: 1,
+        builder: () => _queue.start(url),
+        data: url
+      );
+      item.onLoadData = _receiveData;
+      _files[entry] = _ProxyData(url, item);
+      addLoadItem(item);
+    }
     return entry;
   }
 
-  Response _createResponse(Request request, ResponseData Function(ResponseData) creator) {
-    String mimeType = lookupMimeType(request.handlerPath);
+  Response _createResponse(Request request, dynamic Function(_RangeData) creator) {
+    String mimeType = lookupMimeType(request.url.path);
     String range = request.headers['range'] ?? request.headers['Range'];
     int start = 0, end = -1;
     int statusCode = 200;
@@ -184,35 +296,18 @@ class HlsProxyItem extends ProxyItem {
       }
     }
 
-    var responseData = creator(ResponseData(
-      headers: {
-        "Content-Type": mimeType,
-      },
-      range: ResponseRange(
-        start: start,
-        end: end
-      )
-    ));
+    var body = creator(_RangeData(start, end == -1 ? end : (end + 1)));
+
+    Map<String, Object> headers = {
+      "Content-Type": mimeType
+    };
     if (range != null) {
-      responseData.headers["Content-Range"] = "bytes ${responseData.range.start ?? 0}-${responseData.range.end == -1 ? (responseData.range.total - 1) : responseData.range.end}/${responseData.range.total ?? ""}";
+      headers["Content-Range"] = "bytes ${start ?? 0}-${end == -1 ? "" : end}/${end == -1 ? "" : (end - start + 1)}";
     }
-    responseData.headers["Content-Length"] = "${(responseData.range.end == -1 ? responseData.range.total : (responseData.range.end + 1)) - (responseData.range.start ?? 0)}";
-    var res = Response(statusCode,
-        body: responseData.body,
-        headers: responseData.headers
+    return Response(statusCode,
+        body: body,
+        headers: headers
     );
-    return res;
-  }
-
-  Stream<List<int>> _getStream(RequestItem item, String cacheKey, int start, int end) async* {
-    int offset = start;
-    while (offset < end) {
-      int eoff = math.min(offset + 4096, end);
-      yield await item.readPart(offset, eoff);
-      offset = eoff;
-    }
-
-    server.cacheManager.insert(cacheKey, item.chunks.expand((element) => element).toList());
   }
 
   String handleUrl(String url) {
@@ -256,7 +351,7 @@ class HlsProxyItem extends ProxyItem {
               }
             }
 
-            newLines.add(begin + uri.resolve(sb.toString()).toString().replaceAll('"', '\\"') + tail);
+            newLines.add(begin + handleUrl(uri.resolve(sb.toString()).toString().replaceAll('"', '\\"')) + tail);
           } else if (line.indexOf("#EXT-X-STREAM-INF:") == 0 ||
               line.indexOf("#EXTINF:") == 0) {
             state = ParseState.Url;
@@ -286,55 +381,55 @@ class HlsProxyItem extends ProxyItem {
   Future<Response> handle(Request request, String path) async {
     if (_files.containsKey(path)) {
       String ext = p.extension(path)?.toLowerCase();
-      String cacheKey = "${this.key}/$path";
       if (ext == ".m3u8") {
-        String url = _files[path].url;
-        String body;
-        if (_server.cacheManager.contains(cacheKey)) {
-          Uint8List data = await _server.cacheManager.load(cacheKey);
-          body = utf8.decode(data);
-        } else {
-          RequestItem item = _queue.start(url);
-          List<List<int>> chunks = await item.read();
-          var buf = Uint8List.fromList(chunks.expand<int>((element) => element).toList());
-          body = utf8.decode(buf);
-          _server.cacheManager.insert(cacheKey, buf);
-        }
+        var file = _files[path];
+        LoadItem item = file.customerData;
+        print("url : ${item.data}");
+        var stream = item.read();
+        String body = await utf8.decodeStream(stream);
 
-        body = parseHls(Uri.parse(url), body);
-        
-        return _createResponse(request, (data) {
-          data.body = body;
-          data.range.total = body.length;
-          return data;
-        });
+        body = parseHls(Uri.parse(file.url), body);
+
+        String mimeType = lookupMimeType(request.url.path);
+        return Response(200,
+          body: body,
+          headers: {
+            "Content-Type": mimeType
+          }
+        );
       } else {
-        String url = _files[path].url;
-        if (_server.cacheManager.contains(cacheKey)) {
-          Uint8List body = await _server.cacheManager.load(cacheKey);
-          return _createResponse(request, (data) {
-            data.body = body;
-            data.range.total = body.length;
-            data.range.start = 0;
-            data.range.end = -1;
-            return data;
-          });
-        } else {
-          RequestItem item = _queue.start(url);
-          http.StreamedResponse response = await item.getResponse();
-          return _createResponse(request, (data) {
-            data.body = _getStream(item, cacheKey, 0, response.contentLength);
-            data.range.total = response.contentLength;
-            data.range.start = 0;
-            data.range.end = -1;
-            return data;
-          });
-        }
+        var file = _files[path];
+        LoadItem item = file.customerData;
+
+        return _createResponse(request, (range) {
+          return item.read(range.start, range.end);
+        });
       }
     } else {
       return Response.notFound(null);
     }
   }
+
+  Future<void> checkBuffered() async {
+    for (int i = 0; i < _loadItems.length; ++i) {
+      var item = _loadItems[i];
+      if (item.loaded) {
+        String ext = p.extension(item.cacheKey)?.toLowerCase();
+        if (ext == ".m3u8") {
+          parseHls(Uri.parse(item.data), await utf8.decodeStream(item.read()));
+        }
+      }
+    }
+  }
+
+  @override
+  void processBuffer(LoadItem item, List<int> buffer) {
+    String ext = p.extension(item.cacheKey)?.toLowerCase();
+    if (ext == ".m3u8") {
+      parseHls(Uri.parse(item.data), utf8.decode(buffer));
+    }
+  }
+
 }
 
 class SingleProxyItem extends ProxyItem {
@@ -343,6 +438,7 @@ class SingleProxyItem extends ProxyItem {
   static const int BLOCK_LENGTH = 5 * 1024 * 1024;
   int contentLength;
   bool canSeek;
+  String _rawUrl;
 
   String _cacheKey;
   String get cacheKey {
@@ -352,45 +448,64 @@ class SingleProxyItem extends ProxyItem {
     return _cacheKey;
   }
 
-  SingleProxyItem._(String url) : super._(url);
+  SingleProxyItem._(ProxyServer server, String url) : super._(server, url) {
+    _rawUrl = url;
+    String indexKey = "$cacheKey/index";
+    addLoadItem(LoadItem(
+      proxyItem: this,
+      cacheKey: indexKey,
+      weight: 100,
+      builder: () => requestHEAD(url)
+    ));
+    _ProxyData proxyData = _files[entry];
+    proxyData.customerData = getLoadItem(indexKey);
+  }
+
+  RequestItem requestHEAD(String url) {
+    return _queue.start(url,
+      key: url + "#index#",
+      method: "HEAD",
+      headers: {
+        "Range": "bytes=0-"
+      }
+    );
+  }
+
+  RequestItem requestBody(String url, int index, _RangeData range) {
+    return _queue.start(url,
+      key: url + "#$index#",
+      headers: {
+        "Range": "bytes=${range.start}-${range.end - 1}"
+      }
+    );
+  }
 
   Future<void> getResponse() async {
-    String indexKey = "${this.cacheKey}/index";
     if (contentLength == null) {
-      Uint8List indexBuf;
-      if (server.cacheManager.contains(indexKey)) {
-        indexBuf = await server.cacheManager.load(indexKey);
-        Map<String, dynamic> index = jsonDecode(utf8.decode(indexBuf));
-        contentLength = index["length"];
-        canSeek = index["canSeek"];
-      } else {
-        String urlStr = url.toString();
-        RequestItem item = _queue.start(urlStr,
-            key: urlStr + "#index#",
-            method: "HEAD",
-            headers: {
-              "Range": "bytes=0-"
-            }
-        );
-        http.StreamedResponse response = await item.getResponse();
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          contentLength = response.contentLength;
-          canSeek = response.headers.containsKey("accept-ranges") || response.headers.containsKey("Accept-Ranges");
-        } else {
-          throw "Request failed ${response.statusCode}";
-        }
-        String json = jsonEncode({
-          "length": contentLength,
-          "canSeek": canSeek
-        });
-        server.cacheManager.insert(indexKey, utf8.encode(json));
+      String indexKey = "$cacheKey/index";
+      LoadItem item = getLoadItem(indexKey);
+      var stream = item.read();
+      String str = await utf8.decodeStream(stream);
+      Map<String, dynamic> headers = jsonDecode(str);
+      contentLength = int.parse(headers["content-length"]);
+      canSeek = headers.containsKey("accept-ranges");
+
+      int total = (contentLength / BLOCK_LENGTH).floor();
+      if (contentLength % BLOCK_LENGTH != 0) total++;
+      for (int i = 0; i < total; ++i) {
+        int size = math.min(BLOCK_LENGTH, contentLength - BLOCK_LENGTH * i);
+        addLoadItem(LoadItem(
+            proxyItem: this,
+            cacheKey: "$cacheKey/$i",
+            weight: size,
+            builder: () => requestBody(_rawUrl, i, _RangeData(BLOCK_LENGTH * i, math.min(contentLength, BLOCK_LENGTH * (i + 1))))
+        ));
       }
     }
   }
 
   Stream<List<int>> requestRange(_RangeData range) async* {
     int offset = range.start;
-    String urlStr = url.toString();
     while ((offset < range.end || range.end == -1) && offset < contentLength) {
       int blockIndex = (offset / BLOCK_LENGTH).floor();
       int blockStart = blockIndex * BLOCK_LENGTH, blockEnd = blockStart + BLOCK_LENGTH;
@@ -398,33 +513,9 @@ class SingleProxyItem extends ProxyItem {
       blockEnd = math.min(blockEnd, contentLength);
 
       String cacheKey = "${this.cacheKey}/$blockIndex";
-      if (server.cacheManager.contains(cacheKey)) {
-        var buf = await server.cacheManager.load(cacheKey);
-        var start = offset - blockStart, end = (range.end > 0 ? math.min(blockEnd, range.end) : blockEnd) - blockStart;
-        if (start != 0 || end != blockEnd) {
-          buf = buf.sublist(start, end);
-        }
-        yield buf;
-        offset += buf.length;
-      } else {
-        RequestItem item = _queue.start(urlStr,
-            key: urlStr + "#$blockIndex#",
-            headers: {
-              "Range": "bytes=$blockStart-${blockEnd - 1}"
-            }
-        );
-//        print("[R] ${urlStr + "#$blockIndex#"}");
-        item.onComplete = (chunks) {
-          server.cacheManager.insert(cacheKey, chunks.expand((e) => e).toList());
-        };
-
-        while (offset < blockEnd) {
-          int reqEnd = math.min(blockEnd, offset + STREAM_LENGTH);
-          var buf = await item.readPart(offset - blockStart, reqEnd - blockStart);
-          yield buf;
-          offset += buf.length;
-        }
-      }
+      LoadItem item = getLoadItem(cacheKey);
+      var start = offset - blockStart, end = (range.end > 0 ? math.min(blockEnd, range.end) : blockEnd) - blockStart;
+      yield* item.read(start, end);
     }
   }
 
@@ -446,18 +537,55 @@ class SingleProxyItem extends ProxyItem {
         headers["Content-Range"] = "bytes ${range.start}-${range.end == -1 ? (contentLength - 1) : (range.end - 1)}/$contentLength";
       }
       Response res = Response(hasRange ? 206 : 200,
-          body: body,
-          headers: headers
+        body: body,
+        headers: headers
       );
       return res;
     } else {
       return Response.notFound(null);
     }
   }
+
+
+  Future<void> checkBuffered() async {
+    for (int i = 0; i < _loadItems.length; ++i) {
+      var item = _loadItems[i];
+      if (item.loaded) {
+        if (item.cacheKey == "$cacheKey/index") {
+          await getResponse();
+        }
+      }
+    }
+  }
+
+  @override
+  void processBuffer(LoadItem item, List<int> buffer) {
+    if (contentLength == null && item.cacheKey == "$cacheKey/index") {
+      Map<String, dynamic> headers = jsonDecode(utf8.decode(buffer));
+      contentLength = int.parse(headers["content-length"]);
+      canSeek = headers.containsKey("accept-ranges");
+
+
+      int total = (contentLength / BLOCK_LENGTH).floor();
+      if (contentLength % BLOCK_LENGTH != 0) total++;
+      for (int i = 0; i < total; ++i) {
+        int size = math.min(BLOCK_LENGTH, contentLength - BLOCK_LENGTH * i);
+        addLoadItem(LoadItem(
+            proxyItem: this,
+            cacheKey: "$cacheKey/$i",
+            weight: size,
+            builder: () =>
+                requestBody(_rawUrl, i, _RangeData(BLOCK_LENGTH * i,
+                    math.min(contentLength, BLOCK_LENGTH * (i + 1))))
+        ));
+      }
+    }
+  }
 }
 
 class ProxyServer {
   static ProxyServer _instance;
+  static Completer<ProxyServer> _completer;
 
   HttpMultiServer server;
   Map<String, ProxyItem> items = Map();
@@ -466,8 +594,15 @@ class ProxyServer {
 
   static Future<ProxyServer> get instance async {
     if (_instance == null) {
-      _instance = ProxyServer();
-      await _instance.setup();
+      if (_completer == null) {
+        _completer = Completer();
+        var server = ProxyServer();
+        await server.setup();
+        _instance = server;
+        _completer.complete(server);
+      } else {
+        return _completer.future;
+      }
     }
     return _instance;
   }
@@ -504,7 +639,7 @@ class ProxyServer {
     String key = _calculateKey(url);
     ProxyItem item = items[key];
     if (item == null) {
-      item = ProxyItem(url);
+      item = ProxyItem(this, url);
       items[key] = item;
       item._server = this;
     }

@@ -197,7 +197,7 @@ class OverlayPlayerView extends RelativeLayout implements Player.EventListener {
         closeButton.setOnClickListener(new OnClickListener() {
             @Override
             public void onClick(View v) {
-                exoPlayer.stop();
+                exoPlayer.setPlayWhenReady(false);
                 dismissOverlay();
             }
         });

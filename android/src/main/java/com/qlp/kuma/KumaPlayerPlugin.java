@@ -122,6 +122,7 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
       Number textureId = (Number) map.get("textureId");
       Class<VideoPlayerPlugin> videoPlayerPluginClass = VideoPlayerPlugin.class;
       VideoPlayerPlugin videoPlayerPlugin = (VideoPlayerPlugin)flutterEngine.getPlugins().get(videoPlayerPluginClass);
+      boolean isPlaying = false;
       try {
         Field field = videoPlayerPluginClass.getDeclaredField("videoPlayers");
         field.setAccessible(true);
@@ -131,12 +132,13 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
           OverlayPlayerView overlayPlayerView = overlayPlayers.get(textureId.longValue());
           if (overlayPlayerView != null) {
             overlayPlayerView.dismissOverlay();
+            isPlaying = overlayPlayerView.exoPlayer.getPlayWhenReady();
           }
         }
       } catch (Exception e) {
         e.printStackTrace();
       }
-      result.success(null);
+      result.success(isPlaying);
     } else {
       result.notImplemented();
     }
