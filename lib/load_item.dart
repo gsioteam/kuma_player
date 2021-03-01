@@ -1,8 +1,11 @@
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
+
 import 'proxy_server.dart';
 import 'request_queue.dart';
 import 'dart:math' as math;
+import 'package:flutter/services.dart' show rootBundle;
 
 class LoadItem {
   bool _loaded;
@@ -27,38 +30,66 @@ class LoadItem {
     _loaded = _proxyItem.server.cacheManager.contains(this.cacheKey);
   }
 
+  List<ByteData> _testData = [];
+  Future<ByteData> testData(int idx) async {
+    if (_testData.length <= idx) {
+      _testData.length = idx + 1;
+    }
+    if (_testData[idx] == null) {
+      _testData[idx] = await rootBundle.load("assets/$idx");
+    }
+    return _testData[idx];
+  }
+
   Stream<List<int>> read([int start = 0, int end = -1]) async* {
     if (_proxyItem.server.cacheManager.contains(this.cacheKey)) {
       List<int> buffer = await _proxyItem.server.cacheManager.load(this.cacheKey);
-      if (start != 0 || end > 0) {
-        yield buffer.sublist(start, end > 0 ? end : null);
-      } else {
-        yield buffer;
-      }
-    } else {
-      RequestItem item = _requestItemBuilder();
-      if (item.method.toUpperCase() == "HEAD") {
-        var response = await item.getResponse();
-        String json = jsonEncode(response.headers);
-        List<int> buf = utf8.encode(json);
-        yield buf;
-        onLoadData?.call(buf.length);
-        _onComplete([buf]);
-      } else {
-        item.onComplete = _onComplete;
-        var response = await item.getResponse();
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          if (end < 0) end = response.contentLength;
-          const int BLK_SIZE = 4096;
-          for (int offset = start; offset < end; offset += BLK_SIZE) {
-            var buf = await item.readPart(offset, math.min(end, offset + BLK_SIZE));
-            onLoadData?.call(buf.length);
-            yield buf;
-          }
+      if (buffer != null) {
+        if (start != 0 || end > 0) {
+          print("[S]cached $cacheKey ($start-$end)");
+          var buf = buffer.sublist(start, end > 0 ? end : null);
+          yield buf;
+          print("[E]cached $cacheKey (${buf.length})");
         } else {
-          throw "Request $data failed code:${response.statusCode}";
+          yield buffer;
         }
+        return;
       }
+    }
+
+    RequestItem item = _requestItemBuilder();
+    if (item.method.toUpperCase() == "HEAD") {
+      var response = await item.getResponse();
+      String json = jsonEncode(response.headers);
+      List<int> buf = utf8.encode(json);
+      yield buf;
+      onLoadData?.call(buf.length);
+      _onComplete([buf]);
+    } else {
+      item.onComplete = _onComplete;
+      var response = await item.getResponse();
+      print("URL: ${response.request.url}");
+      print("headers: ${response.headers}");
+      print("statusCode: ${response.statusCode}");
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        if (end < 0) end = response.contentLength;
+        int BLK_SIZE = 4096;
+        for (int offset = start; offset < end; offset += BLK_SIZE) {
+          print("[S]read $cacheKey ($offset-${math.min(end, offset + BLK_SIZE)})");
+          var buf = await item.readPart(offset, math.min(end, offset + BLK_SIZE));
+          print("[E]read $cacheKey (${buf.length})");
+          onLoadData?.call(buf.length);
+          yield buf;
+        }
+      } else {
+        throw "Request $data failed code:${response.statusCode}";
+      }
+    }
+  }
+
+  void clear() {
+    if (_proxyItem.server.cacheManager.contains(this.cacheKey)) {
+      _proxyItem.server.cacheManager.remove(this.cacheKey);
     }
   }
 

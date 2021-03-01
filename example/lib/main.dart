@@ -41,8 +41,6 @@ class _MyAppState extends State<MyApp> {
             child: KumaPlayer(
               controller: controller,
               overlay: true,
-              overlayAlert: "Require overlay permission",
-              overlayButton: "Ok",
             ),
           ),
         ),

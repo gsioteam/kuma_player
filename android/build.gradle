@@ -35,3 +35,7 @@ android {
         implementation 'com.google.android.exoplayer:exoplayer-core:2.9.6'
     }
 }
+
+dependencies {
+    implementation project(path: ':video_player')
+}

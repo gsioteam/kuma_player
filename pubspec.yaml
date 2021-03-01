@@ -1,6 +1,6 @@
 name: kuma_player
 description: A video player for flutter support video cache, and drawing on other app on android.
-version: 0.0.1
+version: 0.1.0
 homepage: https://github.com/gsioteam/kuma_player.git
 
 environment:
@@ -10,7 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  video_player: ">=0.11.0 <1.0.0"
+  video_player: ^1.0.1
   http_multi_server: ^2.2.0
   shelf: ^0.7.9
   http: ^0.12.1

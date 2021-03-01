@@ -24,6 +24,7 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
   bool _disposed = false;
 
   ProxyItem get proxyItem => _proxyItem;
+  Duration _lastPosition;
 
   bool get ready => _readyCompleter.isCompleted;
 
@@ -73,6 +74,56 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
     WidgetsBinding.instance.addObserver(this);
   }
 
+  void reload() {
+    value = VideoPlayerValue(
+      duration: value.duration,
+      size: value.size,
+      position: value.position,
+      caption: value.caption,
+      buffered: value.buffered,
+      isPlaying: value.isPlaying,
+      isLooping: value.isLooping,
+      isBuffering: value.isBuffering,
+      volume: value.volume,
+      playbackSpeed: value.playbackSpeed,
+      errorDescription: null,
+    );
+    _playerController?.dispose();
+    switch (_playerController.dataSourceType) {
+      case DataSourceType.file: {
+        _playerController = VideoPlayerController.file(File.fromUri(Uri.parse(_playerController.dataSource)),
+          closedCaptionFile: _playerController.closedCaptionFile,
+          videoPlayerOptions: _playerController.videoPlayerOptions
+        );
+        break;
+      }
+      case DataSourceType.asset: {
+        _playerController = VideoPlayerController.asset(_playerController.dataSource,
+          package: _playerController.package,
+          closedCaptionFile: _playerController.closedCaptionFile,
+          videoPlayerOptions: _playerController.videoPlayerOptions
+        );
+        break;
+      }
+      case DataSourceType.network: {
+        _playerController = VideoPlayerController.network(_playerController.dataSource,
+          formatHint: _playerController.formatHint,
+          closedCaptionFile: _playerController.closedCaptionFile,
+          videoPlayerOptions: _playerController.videoPlayerOptions
+        );
+        break;
+      }
+    }
+    _playerController.addListener(_updateValue);
+    _playerController.initialize().then((value) {
+      if (_lastPosition != null) {
+        _playerController.seekTo(_lastPosition);
+        _playerController.play();
+      }
+      _ready();
+    });
+  }
+
   void _startUrl(String url, void Function(String) cb) async {
     ProxyServer server = await ProxyServer.instance;
     _proxyItem = server.get(url);
@@ -85,6 +136,11 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
 
   void _updateValue() {
     this.value = _playerController.value;
+    if (value.hasError) {
+      _proxyItem?.gotError();
+    } else {
+      _lastPosition = value.position;
+    }
   }
 
   void _ready() {
@@ -160,30 +216,19 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
 
   Future<void> _setOverlay(bool overlay, {
     BuildContext context,
-    String overlayAlert,
-    String overlayButton
+    ShowAlertListener showAlert,
   }) async {
     if (Platform.isAndroid) {
       _overlay = overlay;
       if (_overlay) {
         if (!await canOverlay()) {
-          await showDialog(
-              context: context,
-              builder: (context) {
-                return AlertDialog(
-                  title: Text(overlayAlert),
-                  actions: [
-                    FlatButton(
-                        child: Text(overlayButton),
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                        }
-                    )
-                  ],
-                );
-              }
-          );
-          await platform.invokeMethod("requestOverlayPermission");
+          Completer<bool> completer = Completer();
+          showAlert(context, (allow) {
+            completer.complete(allow);
+          });
+          bool res = await completer.future;
+          if (res)
+            await platform.invokeMethod("requestOverlayPermission");
         }
       }
     }
@@ -193,6 +238,15 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
   void didChangeAppLifecycleState(AppLifecycleState state) async {
     if (_playerController == null) return;
     switch (state) {
+      case AppLifecycleState.detached: {
+        try {
+          await platform.invokeMethod("destroy");
+        } catch (e) {
+          print("what ? $e");
+        }
+        _playerController = null;
+        break;
+      }
       case AppLifecycleState.paused: {
         bool isPlaying = _playerController.value.isPlaying;
         if (_playerController.value?.size != null && _overlay && await canOverlay()) {
@@ -224,18 +278,19 @@ class KumaPlayerController extends ValueNotifier<VideoPlayerValue> with WidgetsB
 
 }
 
+typedef ShowAlertListener = void Function(BuildContext, void Function(bool allow));
+
 class KumaPlayer extends StatefulWidget {
   final bool overlay;
-  final String overlayAlert;
-  final String overlayButton;
+  final ShowAlertListener showAlert;
   final KumaPlayerController controller;
 
   KumaPlayer({
+    Key key,
     this.overlay = false,
-    this.overlayAlert = "",
-    this.overlayButton = "",
+    this.showAlert,
     @required this.controller
-  });
+  }) : super(key: key);
 
   @override
   State<StatefulWidget> createState() => _KumaPlayerState();
@@ -244,9 +299,23 @@ class KumaPlayer extends StatefulWidget {
 
 class _KumaPlayerState extends State<KumaPlayer> {
 
+  String error;
+
   @override
   Widget build(BuildContext context) {
-    return widget.controller?._playerController == null ? Container() : VideoPlayer(widget.controller._playerController);
+    if (widget.controller._playerController == null) {
+      return Container();
+    } else if (error != null) {
+      return Container(
+        child: Column(
+          children: [
+            Text(error, style: Theme.of(context).textTheme.bodyText1.copyWith(color: Colors.red),)
+          ],
+        ),
+      );
+    } else {
+      return VideoPlayer(widget.controller._playerController);
+    }
   }
 
   @override
@@ -256,8 +325,7 @@ class _KumaPlayerState extends State<KumaPlayer> {
     widget.controller._setOverlay(
       widget.overlay,
       context: context,
-      overlayAlert: widget.overlayAlert,
-      overlayButton: widget.overlayButton
+      showAlert: widget.showAlert
     );
     widget.controller.prepared().then((value) {
       try {
@@ -274,8 +342,7 @@ class _KumaPlayerState extends State<KumaPlayer> {
       widget.controller._setOverlay(
           widget.overlay,
           context: context,
-          overlayAlert: widget.overlayAlert,
-          overlayButton: widget.overlayButton
+          showAlert: widget.showAlert
       );
     }
     if (oldWidget.controller != widget.controller) {
@@ -289,4 +356,5 @@ class _KumaPlayerState extends State<KumaPlayer> {
   void dispose() {
     super.dispose();
   }
+
 }

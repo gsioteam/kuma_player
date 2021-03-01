@@ -15,6 +15,7 @@ import com.google.android.exoplayer2.Format;
 import com.google.android.exoplayer2.SimpleExoPlayer;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.HashMap;
 
 import io.flutter.embedding.engine.FlutterEngine;
@@ -64,8 +65,15 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
   Activity activity;
   final int ACTION_MANAGE_OVERLAY_PERMISSION_REQUEST_CODE = 0x992;
 
+  VideoPlayerPlugin videoPlayerPlugin;
+
   @Override
   public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
+    Class<VideoPlayerPlugin> videoPlayerPluginClass = VideoPlayerPlugin.class;
+    VideoPlayerPlugin plugin = (VideoPlayerPlugin)flutterEngine.getPlugins().get(videoPlayerPluginClass);
+    if (plugin != null) {
+      videoPlayerPlugin = plugin;
+    }
     if (call.method.equals("canOverlay")) {
       if (activity != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         result.success(Settings.canDrawOverlays(activity));
@@ -83,8 +91,6 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
       if (activity != null) {
         HashMap map = (HashMap) call.arguments;
         final Number textureId = (Number) map.get("textureId");
-        Class<VideoPlayerPlugin> videoPlayerPluginClass = VideoPlayerPlugin.class;
-        VideoPlayerPlugin videoPlayerPlugin = (VideoPlayerPlugin)flutterEngine.getPlugins().get(videoPlayerPluginClass);
         try {
           Field field = videoPlayerPluginClass.getDeclaredField("videoPlayers");
           field.setAccessible(true);
@@ -120,8 +126,6 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
     } else if (call.method.equals("removeOverlay")) {
       HashMap map = (HashMap) call.arguments;
       Number textureId = (Number) map.get("textureId");
-      Class<VideoPlayerPlugin> videoPlayerPluginClass = VideoPlayerPlugin.class;
-      VideoPlayerPlugin videoPlayerPlugin = (VideoPlayerPlugin)flutterEngine.getPlugins().get(videoPlayerPluginClass);
       boolean isPlaying = false;
       try {
         Field field = videoPlayerPluginClass.getDeclaredField("videoPlayers");
@@ -151,7 +155,15 @@ public class KumaPlayerPlugin implements FlutterPlugin, MethodCallHandler, Activ
 
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-    channel.setMethodCallHandler(null);
+//    Class<VideoPlayerPlugin> videoPlayerPluginClass = VideoPlayerPlugin.class;
+//    try {
+//      Method method = videoPlayerPluginClass.getDeclaredMethod("onDestroy");
+//      method.setAccessible(true);
+//      method.invoke(videoPlayerPlugin);
+//    } catch (Exception e) {
+//      e.printStackTrace();
+//    }
+//    channel.setMethodCallHandler(null);
   }
 
   @Override

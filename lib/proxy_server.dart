@@ -79,6 +79,7 @@ abstract class ProxyItem {
   int _speed = 0;
   List<void Function(int)> _onSpeeds = [];
   List<void Function()> _onBuffered = [];
+  LoadItem _lastItem;
 
   List<LoadItem> _loadItems = List();
   Map<String, LoadItem> _loadItemIndex = Map();
@@ -132,6 +133,10 @@ abstract class ProxyItem {
     } else {
       return SingleProxyItem._(server, url);
     }
+  }
+
+  void gotError() {
+    _lastItem?.clear();
   }
 
   Future<Response> handle(Request request, String key);
@@ -231,7 +236,7 @@ class HlsProxyItem extends ProxyItem {
       cacheKey: cacheKey,
       builder: () => _queue.start(url),
       data: url
-    ));
+    )..onLoadData = _receiveData);
     _ProxyData proxyData = _files[entry];
     proxyData.customerData = getLoadItem(cacheKey);
   }
@@ -311,7 +316,7 @@ class HlsProxyItem extends ProxyItem {
   }
 
   String handleUrl(String url) {
-    return _insertFile(url);
+    return "/$key/${_insertFile(url)}";
   }
 
   //  static const RegExp
@@ -328,7 +333,6 @@ class HlsProxyItem extends ProxyItem {
       int index = 0;
       switch (state) {
         case ParseState.Line: {
-
           if ((index = line.indexOf(URI_STATE)) >= 0) {
             String begin = line.substring(0, index + URI_STATE.length);
             String tail;
@@ -381,10 +385,23 @@ class HlsProxyItem extends ProxyItem {
   Future<Response> handle(Request request, String path) async {
     if (_files.containsKey(path)) {
       String ext = p.extension(path)?.toLowerCase();
-      if (ext == ".m3u8") {
+      bool isList = false;
+      if (ext != '.m3u8') {
         var file = _files[path];
         LoadItem item = file.customerData;
-        print("url : ${item.data}");
+        var stream = item.read(0, 7);
+        try {
+          var text = await utf8.decodeStream(stream);
+          isList = text == '#EXTM3U';
+        } catch (e) {
+        }
+      } else {
+        isList = true;
+      }
+      if (isList) {
+        var file = _files[path];
+        LoadItem item = file.customerData;
+        _lastItem = item;
         var stream = item.read();
         String body = await utf8.decodeStream(stream);
 
@@ -400,6 +417,7 @@ class HlsProxyItem extends ProxyItem {
       } else {
         var file = _files[path];
         LoadItem item = file.customerData;
+        _lastItem = item;
 
         return _createResponse(request, (range) {
           return item.read(range.start, range.end);
@@ -456,7 +474,7 @@ class SingleProxyItem extends ProxyItem {
       cacheKey: indexKey,
       weight: 100,
       builder: () => requestHEAD(url)
-    ));
+    )..onLoadData = _receiveData);
     _ProxyData proxyData = _files[entry];
     proxyData.customerData = getLoadItem(indexKey);
   }
@@ -499,7 +517,7 @@ class SingleProxyItem extends ProxyItem {
             cacheKey: "$cacheKey/$i",
             weight: size,
             builder: () => requestBody(_rawUrl, i, _RangeData(BLOCK_LENGTH * i, math.min(contentLength, BLOCK_LENGTH * (i + 1))))
-        ));
+        )..onLoadData = _receiveData);
       }
     }
   }
@@ -514,8 +532,12 @@ class SingleProxyItem extends ProxyItem {
 
       String cacheKey = "${this.cacheKey}/$blockIndex";
       LoadItem item = getLoadItem(cacheKey);
+      _lastItem = item;
       var start = offset - blockStart, end = (range.end > 0 ? math.min(blockEnd, range.end) : blockEnd) - blockStart;
-      yield* item.read(start, end);
+      await for (var buf in item.read(start, end)) {
+        yield buf;
+        offset+= buf.length;
+      }
     }
   }
 
@@ -524,10 +546,10 @@ class SingleProxyItem extends ProxyItem {
     if (_files.containsKey(path)) {
       _RangeData range = _getRange(request.headers);
       bool hasRange = range != null;
-      await getResponse();
       if (range == null) {
         range = _RangeData(0, -1);
       }
+      await getResponse();
       var body = requestRange(range);
       var headers = {
         "Content-Type": lookupMimeType(path),
@@ -536,13 +558,14 @@ class SingleProxyItem extends ProxyItem {
       if (hasRange) {
         headers["Content-Range"] = "bytes ${range.start}-${range.end == -1 ? (contentLength - 1) : (range.end - 1)}/$contentLength";
       }
+      print("Response headers $headers");
       Response res = Response(hasRange ? 206 : 200,
-        body: body,
-        headers: headers
+          body: body,
+          headers: headers
       );
       return res;
     } else {
-      return Response.notFound(null);
+      return Response.notFound("Not found $path");
     }
   }
 
@@ -577,7 +600,7 @@ class SingleProxyItem extends ProxyItem {
             builder: () =>
                 requestBody(_rawUrl, i, _RangeData(BLOCK_LENGTH * i,
                     math.min(contentLength, BLOCK_LENGTH * (i + 1))))
-        ));
+        )..onLoadData = _receiveData);
       }
     }
   }
@@ -628,7 +651,11 @@ class ProxyServer {
       }
       ProxyItem item = items[key];
       if (item != null) {
-        return item.handle(request, segs.sublist(split).join("/"));
+        try {
+          return item.handle(request, segs.sublist(split).join("/"));
+        } catch (e) {
+          return Response.internalServerError(body: e.toString());
+        }
       } else {
         return Response.notFound("${request.requestedUri.path} no resource");
       }
